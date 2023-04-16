@@ -546,7 +546,7 @@ class GDMLTorchPredict(nn.Module):
 
         i, j = self.tril_indices
         self.register_buffer(
-            'agg_mat', torch.zeros((self.n_atoms, self.dim_d), dtype=torch.int8)
+            'agg_mat', torch.zeros((self.n_atoms, self.dim_d), dtype=torch.double)
         )
         self.agg_mat[i, range(self.dim_d)] = -1
         self.agg_mat[j, range(self.dim_d)] = 1
