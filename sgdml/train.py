@@ -646,6 +646,265 @@ class GDMLTrain(object):
 
         return task
 
+    def create_task_custom_indices(
+        self,
+        train_dataset,
+        idxs_train,
+        valid_dataset,
+        idxs_valid,
+        sig,
+        lam=1e-10,
+        perms=None,
+        use_sym=True,
+        use_E=True,
+        use_E_cstr=False,
+        callback=None,  # TODO: document me
+    ):
+        """
+        Create a data structure of custom type `task`.
+
+        These data structures serve as recipes for model creation,
+        summarizing the configuration of one particular training run.
+        Training and test points are sampled from the provided dataset,
+        without replacement. If the same dataset if given for training
+        and testing, the subsets are drawn without overlap.
+
+        Each task also contains a choice for the hyper-parameters of the
+        training process and the MD5 fingerprints of the used datasets.
+
+        Parameters
+        ----------
+            train_dataset : :obj:`dict`
+                Data structure of custom type :obj:`dataset` containing
+                train dataset.
+            n_train : int
+                Number of training points to sample.
+            valid_dataset : :obj:`dict`
+                Data structure of custom type :obj:`dataset` containing
+                validation dataset.
+            n_valid : int
+                Number of validation points to sample.
+            sig : int
+                Hyper-parameter (kernel length scale).
+            lam : float, optional
+                Hyper-parameter lambda (regularization strength).
+            perms : :obj:`numpy.ndarray`, optional
+                An 2D array of size P x N containing P possible permutations
+                of the N atoms in the system. This argument takes priority over the ones
+                provided in the trainig dataset. No automatic discovery is run when this
+                argument is provided.
+            use_sym : bool, optional
+                True: include symmetries (sGDML), False: GDML.
+            use_E : bool, optional
+                True: reconstruct force field with corresponding potential energy surface,
+                False: ignore energy during training, even if energy labels are available
+                       in the dataset. The trained model will still be able to predict
+                       energies up to an unknown integration constant. Note, that the
+                       energy predictions accuracy will be untested.
+            use_E_cstr : bool, optional
+                True: include energy constraints in the kernel,
+                False: default (s)GDML.
+            callback : callable, optional
+                Progress callback function that takes three
+                arguments:
+                    current : int
+                        Current progress.
+                    total : int
+                        Task size.
+                    done_str : :obj:`str`, optional
+                        Once complete, this string is shown.
+
+        Returns
+        -------
+            dict
+                Data structure of custom type :obj:`task`.
+
+        Raises
+        ------
+            ValueError
+                If a reconstruction of the potential energy surface is requested,
+                but the energy labels are missing in the dataset.
+        """
+
+        if use_E and 'E' not in train_dataset:
+            raise ValueError(
+                'No energy labels found in dataset!\n'
+                + 'By default, force fields are always reconstructed including the\n'
+                + 'corresponding potential energy surface (this can be turned off).\n'
+                + 'However, the energy labels are missing in the provided dataset.\n'
+            )
+
+        use_E_cstr = use_E and use_E_cstr
+
+        n_atoms = train_dataset['R'].shape[1]
+
+        if callback is not None:
+            callback = partial(callback, disp_str='Hashing dataset(s)')
+            callback(NOT_DONE)
+
+        md5_train = io.dataset_md5(train_dataset)
+        md5_valid = io.dataset_md5(valid_dataset)
+
+        if callback is not None:
+            callback(DONE)
+
+        if callback is not None:
+            callback = partial(
+                callback, disp_str='Sampling training and validation subsets'
+            )
+            callback(NOT_DONE)
+
+        excl_idxs = (
+            idxs_train if md5_train == md5_valid else np.array([], dtype=np.uint)
+        )
+
+        if callback is not None:
+            callback(DONE)
+
+        R_train = train_dataset['R'][idxs_train, :, :]
+        task = {
+            'type': 't',
+            'code_version': __version__,
+            'dataset_name': train_dataset['name'].astype(str),
+            'dataset_theory': train_dataset['theory'].astype(str),
+            'z': train_dataset['z'],
+            'R_train': R_train,
+            'F_train': train_dataset['F'][idxs_train, :, :],
+            'idxs_train': idxs_train,
+            'md5_train': md5_train,
+            'idxs_valid': idxs_valid,
+            'md5_valid': md5_valid,
+            'sig': sig,
+            'lam': lam,
+            'use_E': use_E,
+            'use_E_cstr': use_E_cstr,
+            'use_sym': use_sym,
+        }
+
+        if use_E:
+            task['E_train'] = train_dataset['E'][idxs_train]
+
+        lat_and_inv = None
+        if 'lattice' in train_dataset:
+            task['lattice'] = train_dataset['lattice']
+
+            try:
+                lat_and_inv = (task['lattice'], np.linalg.inv(task['lattice']))
+            except np.linalg.LinAlgError:
+                raise ValueError(  # TODO: Document me
+                    'Provided dataset contains invalid lattice vectors (not invertible). Note: Only rank 3 lattice vector matrices are supported.'
+                )
+
+        if 'r_unit' in train_dataset and 'e_unit' in train_dataset:
+            task['r_unit'] = train_dataset['r_unit']
+            task['e_unit'] = train_dataset['e_unit']
+
+        if use_sym:
+
+            # No permuations provided externally.
+            if perms is None:
+
+                if (
+                    'perms' in train_dataset
+                ):  # take perms from training dataset, if available
+
+                    n_perms = train_dataset['perms'].shape[0]
+                    self.log.info(
+                        'Using {:d} permutations included in dataset.'.format(n_perms)
+                    )
+
+                    task['perms'] = train_dataset['perms']
+
+                else:  # find perms from scratch
+
+                    n_train = R_train.shape[0]
+                    R_train_sync_mat = R_train
+                    if n_train > 1000:
+                        R_train_sync_mat = R_train[
+                            np.random.choice(n_train, 1000, replace=False), :, :
+                        ]
+                        self.log.info(
+                            'Symmetry search has been restricted to a random subset of 1000/{:d} training points for faster convergence.'.format(
+                                n_train
+                            )
+                        )
+
+                    # TOOD: PBCs disabled when matching (for now).
+                    # task['perms'] = perm.find_perms(
+                    #    R_train_sync_mat, train_dataset['z'], lat_and_inv=lat_and_inv, max_processes=self._max_processes,
+                    # )
+                    task['perms'] = perm.find_perms(
+                        R_train_sync_mat,
+                        train_dataset['z'],
+                        # lat_and_inv=None,
+                        lat_and_inv=lat_and_inv,
+                        callback=callback,
+                        max_processes=self._max_processes,
+                    )
+
+                    # NEW
+
+                    USE_EXTRA_PERMS = False
+
+                    if USE_EXTRA_PERMS:
+                        task['perms'] = perm.find_extra_perms(
+                            R_train_sync_mat,
+                            train_dataset['z'],
+                            # lat_and_inv=None,
+                            lat_and_inv=lat_and_inv,
+                            callback=callback,
+                            max_processes=self._max_processes,
+                        )
+
+                    # NEW
+
+                    # NEW
+
+                    USE_FRAG_PERMS = False
+
+                    if USE_FRAG_PERMS:
+                        frag_perms = perm.find_frag_perms(
+                            R_train_sync_mat,
+                            train_dataset['z'],
+                            lat_and_inv=lat_and_inv,
+                            max_processes=self._max_processes,
+                        )
+                        task['perms'] = np.vstack((task['perms'], frag_perms))
+                        task['perms'] = np.unique(task['perms'], axis=0)
+
+                        print(
+                            '| Keeping '
+                            + str(task['perms'].shape[0])
+                            + ' unique permutations.'
+                        )
+
+                    # NEW
+
+            else:  # use provided perms
+
+                n_atoms = len(task['z'])
+                n_perms, perms_len = perms.shape
+
+                if perms_len != n_atoms:
+                    raise ValueError(  # TODO: Document me
+                        'Provided permutations do not match the number of atoms in dataset.'
+                    )
+                else:
+
+                    self.log.info(
+                        'Using {:d} externally provided permutations.'.format(n_perms)
+                    )
+
+                    task['perms'] = perms
+
+        else:
+            task['perms'] = np.arange(train_dataset['R'].shape[1])[
+                None, :
+            ]  # no symmetries
+
+        return task
+
+
     def create_task_from_model(self, model, dataset):
         """
         Create a data structure of custom type `task` from existing
